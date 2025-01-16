@@ -52,30 +52,34 @@ class MCTSState(ABC):
         '''
         state = self
 
-        for _ in range(max_steps):
+        num_steps = 0
+
+        while num_steps < max_steps:
             if state.is_terminal():
                 break
 
             state = state.apply_action(random.choice(state.get_actions()))
+            num_steps += 1
 
         reward = state.reward()
         return reward
 
     @abstractmethod
-    def traversal_value(self, average_value):
+    def process_value(self, value):
         '''When choosing which child node to visit during tree traversal, this
-        method is used to process the average value of each child node. For
-        instance, if the average value has N elements, one for each player, and
+        method is used to process the value of each child node. For
+        instance, if the value has N elements, one for each player, and
         the game is turn-based, this method should pick out the element for the
         player whose turn it is.
 
-        For a one-player game, most likely ``average_value`` can simply be returned.
+        With only one reward element, ``value`` can simply be returned.
 
         Args:
-            average_value (number or arraylike): Average value for the tree node.
+            value (number or arraylike): Value for the tree node, whose
+                shape is the same as that returned by :meth:`~.reward`.
 
         Returns:
-            number or arraylike
+            number
         '''
         pass
 
@@ -97,15 +101,18 @@ class ChessState(MCTSState):
     def reward(self):
         if self.board.is_checkmate():
             winner = not self.board.turn
-            return 1 if winner == chess.WHITE else -1
+            if winner == chess.WHITE:
+                return np.array([1., 0.])
+            else:
+                return np.array([0., 1.])
         else:
-            return 0
+            return np.array([0., 0.])
 
-    def traversal_value(self, average_value):
-        # If it's black's turn, a negative value average is good, and positive is bad, so we
-        # need to flip it.
-        value_sign = 1 if self.board.turn == chess.WHITE else -1
-        return value_sign * average_value
+    def process_value(self, value):
+        if self.board.turn == chess.WHITE:
+            return value[0]
+        else:
+            return value[1]
 
 class MCTSNode:
     '''Node of an MCTS tree.
@@ -113,24 +120,32 @@ class MCTSNode:
     Args:
         state (MCTSState): The state associated with this node.
 
-        parent (MCTSNode or None): The parent node of this node.
+        value_shape (tuple): Shape of a node's value.
+
+        parent (MCTSNode or None, optional): The parent node of this node.
+            Default: ``None``
     '''
-    def __init__(self, state, parent=None):
+    def __init__(self, state, value_shape, parent=None):
         self.state = state
         self.parent = parent
         self.num_visits = 0
         self.action_child_map = {}
-        self.value_sum = 0.0
+        self.value_sum = np.zeros(value_shape)
 
     def value_average(self):
         if self.num_visits == 0:
             return 0.0
         else:
-            return self.value_sum / self.num_visits
+            return self.parent.state.process_value(self.value_sum) / self.num_visits
+
+    C = np.sqrt(2.0)
 
     def traversal_priority(self):
-        C = 200.0
-        ucb1 = self.state.traversal_value(self.value_average()) + C * np.sqrt(np.log(self.parent.num_visits) / self.num_visits)
+        if self.num_visits == 0:
+            ucb1 = float('inf')
+        else:
+            assert self.parent.num_visits > 0
+            ucb1 = self.value_average() + self.C * np.sqrt(np.log(self.parent.num_visits) / self.num_visits)
         return ucb1
 
     def get_action_value_pairs(self):
@@ -157,7 +172,10 @@ class MCTSNode:
 def traverse_MCTS(tree, max_rollout_steps):
     '''Performs one update step of an MCTS tree.
 
-    Uses traversal algorithm described in: https://www.youtube.com/watch?v=UXW2yZndl7U
+    Uses traversal algorithm described in:
+
+        * https://en.wikipedia.org/wiki/Monte_Carlo_tree_search
+        * https://www.youtube.com/watch?v=UXW2yZndl7U
 
     Args:
         tree (MCTSNode): Root node of MCTS tree.
@@ -165,31 +183,20 @@ def traverse_MCTS(tree, max_rollout_steps):
         max_rollout_steps (int): Maximum number of steps to take for each rollout.
     '''
     current_node = tree
-
     done = False
-
-    spacer = ''
 
     while not done:
         if current_node.is_leaf():
             if (current_node.num_visits > 0 and not current_node.state.is_terminal()) or current_node.parent is None:
                 actions = current_node.state.get_actions()
 
-                #print(f"{spacer}adding child actions: {[current_node.state.board.san(action) for action in actions]}")
-
                 for action in actions:
-                    current_node.action_child_map[action] = MCTSNode(current_node.state.apply_action(action), current_node)
+                    current_node.action_child_map[action] = MCTSNode(current_node.state.apply_action(action), current_node.value_sum.shape, current_node)
 
                 chosen_idx = random.choice(range(len(actions)))
-
-                #print(f"{spacer}choosing {current_node.state.board.san(actions[chosen_idx])}")
-
                 current_node = list(current_node.action_child_map.values())[chosen_idx]
 
             rollout_reward = current_node.state.rollout(max_steps=max_rollout_steps)
-
-            #print(f"{spacer}rollout reward {rollout_reward}")
-
             done = True
 
         else:
@@ -197,11 +204,7 @@ def traverse_MCTS(tree, max_rollout_steps):
             children = list(current_node.action_child_map.values())
             priorities = [child.traversal_priority() for child in children]
             chosen_idx = np.argmax(priorities)
-
-            #print(f"{spacer}choosing {current_node.state.board.san(actions[chosen_idx])}")
-
             current_node = children[chosen_idx]
-            spacer = '-' + spacer
 
     while current_node is not None:
         current_node.num_visits += 1
@@ -224,35 +227,29 @@ def eval_fen(fen, iters, max_rollout_steps):
             format, paired with its calculated value.
     '''
     board = chess.Board(fen)
-    tree = MCTSNode(ChessState(board))
+    tree = MCTSNode(ChessState(board), (2,))
 
     for _ in range(iters):
         traverse_MCTS(tree, max_rollout_steps)
-
-    #print('------------------------------')
-    #print(tree)
-    #print('------------------------------')
 
     action_values = reversed(sorted(tree.get_action_value_pairs(), key=lambda x: x[1]))
 
     return [(board.san(action), value) for action, value in action_values]
 
 if __name__ == '__main__':
-    # White has M4, best move is Nf7
-    #fen0 = '3q1r1k/6pp/8/3QNN2/8/8/5PPP/6K1 w - - 0 1'
-    #print(ChessState(chess.Board(fen0)).rollout(1000))
-    #print(eval_fen(fen0, 10000, 20))
-
     # White has M1, best move Rd8. Any other moves lose to M2 or M1.
-    #print(eval_fen('7k/6pp/7p/7K/8/8/6q1/3R4 w - - 0 1', 1000, 10000))
+    print(eval_fen('7k/6pp/7p/7K/8/8/6q1/3R4 w - - 0 1', 100, 20)[0])
 
-    # Black has M1, best move g6#. Other moves give rough equality or worse.
-    #print(eval_fen('6qk/2R4p/7K/8/8/8/8/4R3 b - - 1 1', 1000, 10000))
-
+    # Black has M1, best move Qg6#. Other moves give rough equality or worse.
+    print(eval_fen('6qk/2R4p/7K/8/8/8/8/4R3 b - - 1 1', 100, 20)[0])
 
     # White has M2, best move Rxg8+. Any other move loses.
-    print(eval_fen('2R3qk/5p1p/7K/8/8/8/5r2/2R5 w - - 0 1', 1000, 1000000))
-    print(eval_fen('2R3qk/5p1p/7K/8/8/8/5r2/2R5 w - - 0 1', 1000, 1000000))
-    print(eval_fen('2R3qk/5p1p/7K/8/8/8/5r2/2R5 w - - 0 1', 1000, 1000000))
-    print(eval_fen('2R3qk/5p1p/7K/8/8/8/5r2/2R5 w - - 0 1', 1000, 1000000))
+    print(eval_fen('2R3qk/5p1p/7K/8/8/8/5r2/2R5 w - - 0 1', 10_000, 20)[0])
+
+    # White has M3, best move is N7h6+. Any other move loses or ties.
+    print(eval_fen('qrr3k1/5Npp/8/3Q1N2/8/8/5PPP/6K1 w - - 0 1', 20_000, 20)[0])
+
+    # White has M4, best move is Nf7+. Any other move loses
+    # This one takes ~7 minutes on my machine.
+    #print(eval_fen('qrr4k/6pp/8/3QNN2/8/8/5PPP/6K1 w - - 0 1', 400_000, 20))
 
